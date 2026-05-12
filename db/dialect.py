@@ -1,0 +1,196 @@
+"""
+SQL 方言适配层。
+
+处理 MySQL、PostgreSQL 和 SQLite 之间的语法差异：
+- INSERT OR IGNORE → INSERT IGNORE (MySQL) / ON CONFLICT DO NOTHING (PG)
+- UPSERT 语法
+- 自增主键
+- JSON 列操作
+- 分页语法
+- 全文搜索
+"""
+
+from enum import Enum
+from typing import List, Optional
+
+
+class DbType(Enum):
+    SQLITE = "sqlite"
+    MYSQL = "mysql"
+    POSTGRESQL = "postgresql"
+
+
+class DialectHelper:
+    """
+    SQL 方言辅助类。
+
+    为不同数据库提供统一的 SQL 生成接口。
+    当前 Agent 中所有手工拼接的 SQL 都应该通过此类生成，
+    以保证跨数据库兼容性。
+
+    用法:
+        helper = DialectHelper(DbType.POSTGRESQL)
+        sql = helper.insert_or_ignore("sessions", ["id", "source", "started_at"])
+    """
+
+    def __init__(self, db_type: DbType):
+        self._db_type = db_type
+
+    @property
+    def db_type(self) -> DbType:
+        return self._db_type
+
+    # ── 核心语法差异 ──────────────────────────────────────────
+
+    def insert_or_ignore(self, table: str, columns: List[str],
+                         conflict_columns: List[str] = None) -> str:
+        """
+        生成 INSERT OR IGNORE 语句。
+
+        SQLite:   INSERT OR IGNORE INTO t (a,b) VALUES (?,?)
+        MySQL:    INSERT IGNORE INTO t (a,b) VALUES (?,?)
+        PG:       INSERT INTO t (a,b) VALUES (?,?) ON CONFLICT (a) DO NOTHING
+        """
+        placeholders = ", ".join("?" * len(columns))
+        cols = ", ".join(columns)
+
+        if self._db_type == DbType.SQLITE:
+            return f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})"
+        elif self._db_type == DbType.MYSQL:
+            return f"INSERT IGNORE INTO {table} ({cols}) VALUES ({placeholders})"
+        elif self._db_type == DbType.POSTGRESQL:
+            conflict_cols = conflict_columns or [columns[0]]
+            conflict_str = ", ".join(conflict_cols)
+            return (
+                f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) "
+                f"ON CONFLICT ({conflict_str}) DO NOTHING"
+            )
+
+    def upsert(self, table: str, columns: List[str],
+               conflict_columns: List[str],
+               update_columns: List[str]) -> str:
+        """
+        生成 UPSERT（存在则更新，不存在则插入）语句。
+
+        SQLite:   INSERT ... ON CONFLICT ... DO UPDATE SET ...
+        MySQL:    INSERT ... ON DUPLICATE KEY UPDATE ...
+        PG:       INSERT ... ON CONFLICT ... DO UPDATE SET ...
+        """
+        placeholders = ", ".join("?" * len(columns))
+        cols = ", ".join(columns)
+        conflict_cols = ", ".join(conflict_columns)
+
+        if self._db_type == DbType.MYSQL:
+            set_clause = ", ".join(f"{c} = VALUES({c})" for c in update_columns)
+            return (
+                f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) "
+                f"ON DUPLICATE KEY UPDATE {set_clause}"
+            )
+        else:
+            # SQLite 3.24+ 和 PostgreSQL 都支持 ON CONFLICT
+            set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_columns)
+            return (
+                f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) "
+                f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
+            )
+
+    def limit_offset(self, limit: int, offset: int = 0) -> str:
+        """
+        生成 LIMIT/OFFSET 子句。
+
+        MySQL/PG/SQLite 都支持 LIMIT ? OFFSET ?，此方法保留用于未来扩展。
+        """
+        if offset:
+            return f"LIMIT {limit} OFFSET {offset}"
+        return f"LIMIT {limit}"
+
+    # ── 占位符 ────────────────────────────────────────────────
+
+    def placeholder(self, index: int = None) -> str:
+        """
+        返回参数占位符。
+
+        PostgreSQL 使用 $1, $2, ...，MySQL/SQLite 使用 ?。
+        当前实现统一使用 ?，由底层驱动自动处理。
+        """
+        return "?"
+
+    # ── JSON 列操作 ────────────────────────────────────────────
+
+    def json_extract(self, column: str, path: str) -> str:
+        """生成从 JSON 列中提取值的表达式"""
+        if self._db_type == DbType.MYSQL:
+            # path 格式如 '$.key'
+            return f"JSON_EXTRACT({column}, '{path}')"
+        elif self._db_type == DbType.POSTGRESQL:
+            return f"{column}->>'{path.lstrip('$.')}'"
+        else:
+            # SQLite 使用 json_extract 函数
+            return f"json_extract({column}, '{path}')"
+
+    def json_set(self, column: str, path: str) -> str:
+        """生成更新 JSON 列中指定路径值的表达式（用于 UPDATE SET）"""
+        if self._db_type == DbType.MYSQL:
+            return f"JSON_SET({column}, '{path}', ?)"
+        elif self._db_type == DbType.POSTGRESQL:
+            key = path.lstrip("$.")
+            return f"jsonb_set({column}, '{{{key}}}', ?::jsonb)"
+        else:
+            return f"json_set({column}, '{path}', ?)"
+
+    # ── 自增主键 ──────────────────────────────────────────────
+
+    def auto_increment_clause(self, column: str = "id") -> str:
+        """生成自增主键的 DDL 片段"""
+        if self._db_type == DbType.MYSQL:
+            return f"{column} BIGINT AUTO_INCREMENT PRIMARY KEY"
+        elif self._db_type == DbType.POSTGRESQL:
+            return f"{column} BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"
+        else:
+            return f"{column} INTEGER PRIMARY KEY AUTOINCREMENT"
+
+    def last_insert_id_sql(self, table: str = None, column: str = "id") -> str:
+        """获取最后插入的自增 ID"""
+        if self._db_type == DbType.POSTGRESQL:
+            # PG 需要指定序列表名
+            seq = f"{table}_{column}_seq" if table else "lastval()"
+            return f"SELECT currval('{seq}')" if table else "SELECT lastval()"
+        elif self._db_type == DbType.MYSQL:
+            return "SELECT LAST_INSERT_ID()"
+        else:
+            return "SELECT last_insert_rowid()"
+
+    # ── 字符串函数 ─────────────────────────────────────────────
+
+    def like_escape_char(self) -> str:
+        """返回 LIKE 子句的转义字符"""
+        return "\\"
+
+    # ── 布尔值 ────────────────────────────────────────────────
+
+    def boolean_true(self) -> str:
+        """布尔 true 值的字面量"""
+        if self._db_type == DbType.POSTGRESQL:
+            return "TRUE"
+        else:
+            return "1"
+
+    def boolean_false(self) -> str:
+        """布尔 false 值的字面量"""
+        if self._db_type == DbType.POSTGRESQL:
+            return "FALSE"
+        else:
+            return "0"
+
+
+# 进程级单例
+_dialect: DialectHelper = None
+
+
+def get_dialect() -> DialectHelper:
+    """获取进程级方言辅助器单例（延迟导入避免循环依赖）"""
+    global _dialect
+    if _dialect is None:
+        import db.connection as _conn
+        _dialect = _conn.get_db_manager().dialect
+    return _dialect

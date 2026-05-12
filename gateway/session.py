@@ -1274,16 +1274,18 @@ class SessionStore:
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
         
-        # Also write legacy JSONL (keeps existing tooling working during transition)
-        transcript_path = self.get_transcript_path(session_id)
-        try:
-            with self._lock:
-                with open(transcript_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(message, ensure_ascii=False) + "\n")
-        except OSError as e:
-            # Disk full / read-only fs / permission errors must not crash the
-            # message handler — the SQLite write above is the primary store.
-            logger.debug("Failed to write JSONL transcript for %s: %s", session_id, e)
+        # 共享数据库模式下跳过 JSONL 写入，数据已存储在共享数据库中
+        if not getattr(self._db, "_use_shared_db", False):
+            # Also write legacy JSONL (keeps existing tooling working during transition)
+            transcript_path = self.get_transcript_path(session_id)
+            try:
+                with self._lock:
+                    with open(transcript_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(message, ensure_ascii=False) + "\n")
+            except OSError as e:
+                # Disk full / read-only fs / permission errors must not crash the
+                # message handler — the SQLite write above is the primary store.
+                logger.debug("Failed to write JSONL transcript for %s: %s", session_id, e)
     
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Replace the entire transcript for a session with new messages.
@@ -1299,11 +1301,12 @@ class SessionStore:
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
         
-        # JSONL: overwrite the file
-        transcript_path = self.get_transcript_path(session_id)
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        # 共享数据库模式下跳过 JSONL 写入，数据已存储在共享数据库中
+        if not getattr(self._db, "_use_shared_db", False):
+            transcript_path = self.get_transcript_path(session_id)
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                for msg in messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""

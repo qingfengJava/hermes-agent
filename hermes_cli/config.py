@@ -4123,6 +4123,15 @@ def load_config() -> Dict[str, Any]:
             except Exception as e:
                 _warn_config_parse_failure(config_path, e)
 
+        # 从共享数据库加载配置覆盖（Web UI 管理的配置优先于 YAML 文件）
+        try:
+            from hermes_cli.config_db import load_db_overrides
+            db_overrides = load_db_overrides()
+            if db_overrides:
+                config = _deep_merge(config, db_overrides)
+        except Exception:
+            pass
+
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)

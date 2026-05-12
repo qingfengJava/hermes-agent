@@ -16,6 +16,7 @@ Key design decisions:
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -306,12 +307,25 @@ END;
 """
 
 
+def _detect_shared_db() -> bool:
+    """
+    检测是否启用共享数据库。
+
+    通过环境变量控制：
+    - HERMES_DB_TYPE=mysql → MySQL（生产环境推荐）
+    - HERMES_DB_TYPE=postgresql → PostgreSQL
+    - 未设置/空/sqlite → 本地 SQLite（向后兼容）
+    """
+    db_type = os.environ.get("HERMES_DB_TYPE", "sqlite").lower()
+    return db_type not in ("sqlite", "")
+
+
 class SessionDB:
     """
-    SQLite-backed session storage with FTS5 search.
+    Session storage with pluggable backends.
 
-    Thread-safe for the common gateway pattern (multiple reader threads,
-    single writer via WAL mode). Each method opens its own cursor.
+    SQLite（默认）：原有本地存储
+    MySQL/PostgreSQL：通过 HERMES_DB_TYPE 和 HERMES_DB_URL 环境变量配置的共享数据库
     """
 
     # ── Write-contention tuning ──
@@ -333,60 +347,54 @@ class SessionDB:
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # 检测是否启用共享数据库（MySQL/PostgreSQL），由环境变量控制
+        self._use_shared_db = _detect_shared_db()
+
         self._lock = threading.Lock()
         self._write_count = 0
         try:
-            self._conn = sqlite3.connect(
-                str(self.db_path),
-                check_same_thread=False,
-                # Short timeout — application-level retry with random jitter
-                # handles contention instead of sitting in SQLite's internal
-                # busy handler for up to 30s.
-                timeout=1.0,
-                # Autocommit mode: Python's default isolation_level=""
-                # auto-starts transactions on DML, which conflicts with our
-                # explicit BEGIN IMMEDIATE.  None = we manage transactions
-                # ourselves.
-                isolation_level=None,
-            )
-            self._conn.row_factory = sqlite3.Row
-            apply_wal_with_fallback(self._conn, db_label="state.db")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-
-            self._init_schema()
+            if self._use_shared_db:
+                self._init_shared_db()
+            else:
+                self._conn = sqlite3.connect(
+                    str(self.db_path),
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+                self._conn.row_factory = sqlite3.Row
+                apply_wal_with_fallback(self._conn, db_label="state.db")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._init_schema()
         except Exception as exc:
-            # Capture the cause so /resume and friends can surface WHY the
-            # session DB is unavailable instead of a bare "Session database
-            # not available."  Callers that catch this exception keep their
-            # existing ``self._session_db = None`` degradation path.
-            #
-            # Note: we deliberately do NOT clear _last_init_error on the
-            # success path (no else branch).  In multi-threaded callers
-            # (gateway, web_server per-request SessionDB()), a concurrent
-            # successful open racing past this failure would erase the
-            # cause that another thread's /resume is about to format.
-            # Tests that need to reset the state can call
-            # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    def _init_shared_db(self):
+        """初始化共享数据库（MySQL/PostgreSQL）适配层"""
+        from db.connection import get_db_manager
+        from db.adapter import ConnectionAdapter
+        from db.schema import init_schema
+
+        db_mgr = get_db_manager()
+        db_mgr.initialize()
+        init_schema(db_mgr)
+        self._conn = ConnectionAdapter(db_mgr)
+        self._db = db_mgr
 
     # ── Core write helper ──
 
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
+        """Execute a write transaction.
 
-        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
-        statements.  The caller must NOT call ``commit()`` — that's handled
-        here after *fn* returns.
-
-        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
-        (not at commit time), so lock contention surfaces immediately.
-        On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
-        SQLite's built-in deterministic backoff creates.
-
-        Returns whatever *fn* returns.
+        共享数据库模式：使用 DatabaseManager 的事务上下文，失败时抛出异常。
+        SQLite 模式：使用 BEGIN IMMEDIATE + jitter retry 处理写锁竞争。
         """
+        if self._use_shared_db:
+            # 共享数据库：利用数据库自身的行级锁，不需要应用层重试
+            with self._db.transaction() as conn:
+                return fn(self._conn)
+        # ── 原有 SQLite 写重试逻辑 ──
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
@@ -401,7 +409,6 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
@@ -417,21 +424,15 @@ class SessionDB:
                         )
                         time.sleep(jitter)
                         continue
-                # Non-lock error or retries exhausted — propagate.
                 raise
-        # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
         )
 
     def _try_wal_checkpoint(self) -> None:
-        """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
-
-        Flushes committed WAL frames back into the main DB file for any
-        frames that no other connection currently needs.  Keeps the WAL
-        from growing unbounded when many processes hold persistent
-        connections.
-        """
+        """Best-effort WAL checkpoint（仅 SQLite 模式）。"""
+        if self._use_shared_db:
+            return
         try:
             with self._lock:
                 result = self._conn.execute(
@@ -443,14 +444,15 @@ class SessionDB:
                         result[2], result[1],
                     )
         except Exception:
-            pass  # Best effort — never fatal.
+            pass
 
     def close(self):
-        """Close the database connection.
-
-        Attempts a PASSIVE WAL checkpoint first so that exiting processes
-        help keep the WAL file from growing unbounded.
-        """
+        """Close the database connection。"""
+        if self._use_shared_db:
+            if hasattr(self, '_db') and self._db:
+                self._db.close()
+            self._conn = None
+            return
         with self._lock:
             if self._conn:
                 try:
@@ -504,18 +506,10 @@ class SessionDB:
             ref.close()
 
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
-        """Ensure live tables have every column declared in SCHEMA_SQL.
-
-        Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
-        in SCHEMA_SQL is the single source of truth for the desired schema.
-        On every startup this method diffs the live columns (via PRAGMA
-        table_info) against the declared columns, and ADDs any that are
-        missing.
-
-        This makes column additions a declarative operation — just add
-        the column to SCHEMA_SQL and it appears on the next startup.
-        Version-gated migration blocks are no longer needed for ADD COLUMN.
-        """
+        """Ensure live tables have every column declared in SCHEMA_SQL（仅 SQLite 模式）。"""
+        if self._use_shared_db:
+            return
+        # ── 原有列校对逻辑 ──
         expected = self._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
             # Get current columns from the live table
@@ -548,18 +542,11 @@ class SessionDB:
                         )
 
     def _init_schema(self):
-        """Create tables and FTS if they don't exist, reconcile columns.
-
-        Schema management follows the declarative reconciliation pattern
-        (Beets, sqlite-utils): SCHEMA_SQL is the single source of truth.
-        On existing databases, _reconcile_columns() diffs live columns
-        against SCHEMA_SQL and ADDs any missing ones.  This eliminates
-        the version-gated migration chain for column additions, making
-        it impossible for reordered or inserted migrations to skip columns.
-
-        The schema_version table is retained for future data migrations
-        (transforming existing rows) which cannot be handled declaratively.
-        """
+        """创建表结构和 FTS 索引（仅 SQLite 模式）。"""
+        if self._use_shared_db:
+            # 共享数据库的 Schema 由 db/schema.py 管理
+            return
+        # ── 原有 SQLite Schema 初始化 ──
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
@@ -1887,19 +1874,14 @@ class SessionDB:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """
-        Full-text search across session messages using FTS5.
-
-        Supports FTS5 query syntax:
-          - Simple keywords: "docker deployment"
-          - Phrases: '"exact phrase"'
-          - Boolean: "docker OR kubernetes", "python NOT java"
-          - Prefix: "deploy*"
-
-        Returns matching messages with session metadata, content snippet,
-        and surrounding context (1 message before and after the match).
+        Full-text search across session messages using FTS5（SQLite）或 LIKE（共享数据库）。
         """
         if not query or not query.strip():
             return []
+        # 共享数据库不支持 FTS5，降级为 LIKE 搜索
+        if self._use_shared_db:
+            return self._search_messages_like(query, source_filter, exclude_sources,
+                                              role_filter, limit, offset)
 
         query = self._sanitize_fts5_query(query)
         if not query:
@@ -2146,6 +2128,75 @@ class SessionDB:
         for match in matches:
             match.pop("content", None)
 
+        return matches
+
+    def _search_messages_like(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        共享数据库的 LIKE 搜索实现（替代 FTS5）。
+        """
+        raw_query = query.strip().strip('"').strip()
+        esc = raw_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+        where_parts = ["(m.content LIKE ? ESCAPE '\\\\' OR m.tool_name LIKE ? ESCAPE '\\\\')"]
+        params = [f"%{esc}%", f"%{esc}%"]
+
+        if source_filter is not None:
+            where_parts.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+            params.extend(source_filter)
+        if exclude_sources is not None:
+            where_parts.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+            params.extend(exclude_sources)
+        if role_filter:
+            where_parts.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+            params.extend(role_filter)
+
+        where_sql = " AND ".join(where_parts)
+        like_sql = f"""
+            SELECT m.id, m.session_id, m.role,
+                   SUBSTR(m.content, GREATEST(1, INSTR(m.content, ?) - 40), 120) AS snippet,
+                   m.content, m.timestamp, m.tool_name,
+                   s.source, s.model, s.started_at AS session_started
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {where_sql}
+            ORDER BY m.timestamp DESC
+            LIMIT ? OFFSET ?
+        """
+        like_params = [raw_query] + params + [limit, offset]
+
+        with self._lock:
+            cursor = self._conn.execute(like_sql, like_params)
+            matches = [dict(row) for row in cursor.fetchall()]
+
+        # 上下文
+        for match in matches:
+            try:
+                with self._lock:
+                    ctx_cursor = self._conn.execute(
+                        """SELECT role, content FROM (
+                            SELECT m.role, m.content, m.timestamp, m.id
+                            FROM messages m
+                            WHERE m.session_id = ? AND m.timestamp < ?
+                            ORDER BY m.timestamp DESC, m.id DESC LIMIT 1
+                        ) AS ctx""",
+                        (match["session_id"], match["timestamp"]),
+                    )
+                    ctx_msgs = [{"role": r["role"], "content": (r["content"] or "")[:200]}
+                                for r in ctx_cursor.fetchall()]
+                match["context"] = ctx_msgs
+            except Exception:
+                match["context"] = []
+
+        for match in matches:
+            match.pop("content", None)
         return matches
 
     def search_sessions(
@@ -2769,22 +2820,11 @@ class SessionDB:
     # ── Space reclamation ──
 
     def vacuum(self) -> None:
-        """Run VACUUM to reclaim disk space after large deletes.
-
-        SQLite does not shrink the database file when rows are deleted —
-        freed pages just get reused on the next insert. After a prune that
-        removed hundreds of sessions, the file stays bloated unless we
-        explicitly VACUUM.
-
-        VACUUM rewrites the entire DB, so it's expensive (seconds per
-        100MB) and cannot run inside a transaction. It also acquires an
-        exclusive lock, so callers must ensure no other writers are
-        active. Safe to call at startup before the gateway/CLI starts
-        serving traffic.
-        """
-        # VACUUM cannot be executed inside a transaction.
+        """Run VACUUM to reclaim disk space after large deletes（仅 SQLite 模式）。"""
+        if self._use_shared_db:
+            # PostgreSQL/MySQL 由自身管理磁盘空间，不需要手动 VACUUM
+            return
         with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM.
             try:
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception:
