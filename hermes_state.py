@@ -16,7 +16,6 @@ Key design decisions:
 
 import json
 import logging
-import os
 import random
 import re
 import sqlite3
@@ -26,7 +25,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -237,7 +236,8 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning_content TEXT,
     reasoning_details TEXT,
     codex_reasoning_items TEXT,
-    codex_message_items TEXT
+    codex_message_items TEXT,
+    platform_message_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -307,25 +307,12 @@ END;
 """
 
 
-def _detect_shared_db() -> bool:
-    """
-    检测是否启用共享数据库。
-
-    通过环境变量控制：
-    - HERMES_DB_TYPE=mysql → MySQL（生产环境推荐）
-    - HERMES_DB_TYPE=postgresql → PostgreSQL
-    - 未设置/空/sqlite → 本地 SQLite（向后兼容）
-    """
-    db_type = os.environ.get("HERMES_DB_TYPE", "sqlite").lower()
-    return db_type not in ("sqlite", "")
-
-
 class SessionDB:
     """
-    Session storage with pluggable backends.
+    SQLite-backed session storage with FTS5 search.
 
-    SQLite（默认）：原有本地存储
-    MySQL/PostgreSQL：通过 HERMES_DB_TYPE 和 HERMES_DB_URL 环境变量配置的共享数据库
+    Thread-safe for the common gateway pattern (multiple reader threads,
+    single writer via WAL mode). Each method opens its own cursor.
     """
 
     # ── Write-contention tuning ──
@@ -347,54 +334,60 @@ class SessionDB:
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 检测是否启用共享数据库（MySQL/PostgreSQL），由环境变量控制
-        self._use_shared_db = _detect_shared_db()
-
         self._lock = threading.Lock()
         self._write_count = 0
         try:
-            if self._use_shared_db:
-                self._init_shared_db()
-            else:
-                self._conn = sqlite3.connect(
-                    str(self.db_path),
-                    check_same_thread=False,
-                    timeout=1.0,
-                    isolation_level=None,
-                )
-                self._conn.row_factory = sqlite3.Row
-                apply_wal_with_fallback(self._conn, db_label="state.db")
-                self._conn.execute("PRAGMA foreign_keys=ON")
-                self._init_schema()
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                # Short timeout — application-level retry with random jitter
+                # handles contention instead of sitting in SQLite's internal
+                # busy handler for up to 30s.
+                timeout=1.0,
+                # Autocommit mode: Python's default isolation_level=""
+                # auto-starts transactions on DML, which conflicts with our
+                # explicit BEGIN IMMEDIATE.  None = we manage transactions
+                # ourselves.
+                isolation_level=None,
+            )
+            self._conn.row_factory = sqlite3.Row
+            apply_wal_with_fallback(self._conn, db_label="state.db")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+
+            self._init_schema()
         except Exception as exc:
+            # Capture the cause so /resume and friends can surface WHY the
+            # session DB is unavailable instead of a bare "Session database
+            # not available."  Callers that catch this exception keep their
+            # existing ``self._session_db = None`` degradation path.
+            #
+            # Note: we deliberately do NOT clear _last_init_error on the
+            # success path (no else branch).  In multi-threaded callers
+            # (gateway, web_server per-request SessionDB()), a concurrent
+            # successful open racing past this failure would erase the
+            # cause that another thread's /resume is about to format.
+            # Tests that need to reset the state can call
+            # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
-
-    def _init_shared_db(self):
-        """初始化共享数据库（MySQL/PostgreSQL）适配层"""
-        from db.connection import get_db_manager
-        from db.adapter import ConnectionAdapter
-        from db.schema import init_schema
-
-        db_mgr = get_db_manager()
-        db_mgr.initialize()
-        init_schema(db_mgr)
-        self._conn = ConnectionAdapter(db_mgr)
-        self._db = db_mgr
 
     # ── Core write helper ──
 
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        """Execute a write transaction.
+        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
-        共享数据库模式：使用 DatabaseManager 的事务上下文，失败时抛出异常。
-        SQLite 模式：使用 BEGIN IMMEDIATE + jitter retry 处理写锁竞争。
+        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
+        statements.  The caller must NOT call ``commit()`` — that's handled
+        here after *fn* returns.
+
+        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
+        (not at commit time), so lock contention surfaces immediately.
+        On ``database is locked``, we release the Python lock, sleep a
+        random 20-150ms, and retry — breaking the convoy pattern that
+        SQLite's built-in deterministic backoff creates.
+
+        Returns whatever *fn* returns.
         """
-        if self._use_shared_db:
-            # 共享数据库：利用数据库自身的行级锁，不需要应用层重试
-            with self._db.transaction() as conn:
-                return fn(self._conn)
-        # ── 原有 SQLite 写重试逻辑 ──
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
@@ -409,6 +402,7 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
+                # Success — periodic best-effort checkpoint.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
@@ -424,15 +418,21 @@ class SessionDB:
                         )
                         time.sleep(jitter)
                         continue
+                # Non-lock error or retries exhausted — propagate.
                 raise
+        # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
         )
 
     def _try_wal_checkpoint(self) -> None:
-        """Best-effort WAL checkpoint（仅 SQLite 模式）。"""
-        if self._use_shared_db:
-            return
+        """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
+
+        Flushes committed WAL frames back into the main DB file for any
+        frames that no other connection currently needs.  Keeps the WAL
+        from growing unbounded when many processes hold persistent
+        connections.
+        """
         try:
             with self._lock:
                 result = self._conn.execute(
@@ -444,15 +444,14 @@ class SessionDB:
                         result[2], result[1],
                     )
         except Exception:
-            pass
+            pass  # Best effort — never fatal.
 
     def close(self):
-        """Close the database connection。"""
-        if self._use_shared_db:
-            if hasattr(self, '_db') and self._db:
-                self._db.close()
-            self._conn = None
-            return
+        """Close the database connection.
+
+        Attempts a PASSIVE WAL checkpoint first so that exiting processes
+        help keep the WAL file from growing unbounded.
+        """
         with self._lock:
             if self._conn:
                 try:
@@ -506,10 +505,18 @@ class SessionDB:
             ref.close()
 
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
-        """Ensure live tables have every column declared in SCHEMA_SQL（仅 SQLite 模式）。"""
-        if self._use_shared_db:
-            return
-        # ── 原有列校对逻辑 ──
+        """Ensure live tables have every column declared in SCHEMA_SQL.
+
+        Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
+        in SCHEMA_SQL is the single source of truth for the desired schema.
+        On every startup this method diffs the live columns (via PRAGMA
+        table_info) against the declared columns, and ADDs any that are
+        missing.
+
+        This makes column additions a declarative operation — just add
+        the column to SCHEMA_SQL and it appears on the next startup.
+        Version-gated migration blocks are no longer needed for ADD COLUMN.
+        """
         expected = self._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
             # Get current columns from the live table
@@ -542,11 +549,18 @@ class SessionDB:
                         )
 
     def _init_schema(self):
-        """创建表结构和 FTS 索引（仅 SQLite 模式）。"""
-        if self._use_shared_db:
-            # 共享数据库的 Schema 由 db/schema.py 管理
-            return
-        # ── 原有 SQLite Schema 初始化 ──
+        """Create tables and FTS if they don't exist, reconcile columns.
+
+        Schema management follows the declarative reconciliation pattern
+        (Beets, sqlite-utils): SCHEMA_SQL is the single source of truth.
+        On existing databases, _reconcile_columns() diffs live columns
+        against SCHEMA_SQL and ADDs any missing ones.  This eliminates
+        the version-gated migration chain for column additions, making
+        it impossible for reordered or inserted migrations to skip columns.
+
+        The schema_version table is retained for future data migrations
+        (transforming existing rows) which cannot be handled declaratively.
+        """
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
@@ -557,6 +571,19 @@ class SessionDB:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # Indexes that reference reconciler-added columns must be created
+        # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
+        # makes the initial executescript fail on legacy DBs (the index's
+        # WHERE clause references a column that doesn't exist yet).
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
+                "ON messages(session_id, platform_message_id) "
+                "WHERE platform_message_id IS NOT NULL"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
 
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
@@ -1432,12 +1459,19 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        platform_message_id: str = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
 
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
+
+        ``platform_message_id`` is the external messaging platform's own
+        message ID (e.g. Telegram update_id, Yuanbao msg_id).  It is
+        independent of the SQLite autoincrement primary key and is used by
+        platform-specific flows like yuanbao's recall guard to redact a
+        message by its platform-side identifier.
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -1467,8 +1501,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -1484,6 +1518,7 @@ class SessionDB:
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    platform_message_id,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -1545,13 +1580,18 @@ class SessionDB:
                     json.dumps(codex_message_items) if codex_message_items else None
                 )
                 tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+                # Accept either `platform_message_id` (new explicit name) or
+                # `message_id` (yuanbao's existing convention on message dicts).
+                platform_msg_id = (
+                    msg.get("platform_message_id") or msg.get("message_id")
+                )
 
                 conn.execute(
                     """INSERT INTO messages (session_id, role, content, tool_call_id,
                        tool_calls, tool_name, timestamp, token_count, finish_reason,
                        reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                       codex_message_items)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       codex_message_items, platform_message_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         role,
@@ -1567,6 +1607,7 @@ class SessionDB:
                         reasoning_details_json,
                         codex_items_json,
                         codex_message_items_json,
+                        platform_msg_id,
                     ),
                 )
                 total_messages += 1
@@ -1584,10 +1625,10 @@ class SessionDB:
         self._execute_write(_do)
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages for a session, ordered by timestamp."""
+        """Load all messages for a session, ordered by insertion order."""
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
                 (session_id,),
             )
             rows = cursor.fetchall()
@@ -1604,6 +1645,204 @@ class SessionDB:
                     msg["tool_calls"] = []
             result.append(msg)
         return result
+
+    def get_messages_around(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+    ) -> Dict[str, Any]:
+        """Load a window of messages anchored on a specific message id.
+
+        Returns a dict with:
+          - ``window``: up to ``window`` messages before the anchor, the anchor
+            itself, and up to ``window`` messages after, ordered by id ascending.
+          - ``messages_before``: count of messages strictly before the anchor
+            still in the session (== window unless we hit the start).
+          - ``messages_after``: count of messages strictly after the anchor
+            still in the session (== window unless we hit the end).
+
+        Used by ``session_search`` for both the discovery shape (anchored on the
+        FTS5 match) and the scroll shape (anchored on any message id). The
+        ``messages_before`` / ``messages_after`` counts let the caller detect
+        session boundaries: when either is less than ``window``, the agent has
+        reached one end of the session.
+
+        Returns an empty window when ``around_message_id`` is not a real id in
+        ``session_id`` — callers decide how to surface that.
+        """
+        if window < 0:
+            window = 0
+        with self._lock:
+            # Confirm the anchor exists in this session.
+            anchor_exists = self._conn.execute(
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                (around_message_id, session_id),
+            ).fetchone()
+            if not anchor_exists:
+                return {"window": [], "messages_before": 0, "messages_after": 0}
+
+            # Two queries: anchor + before (DESC, take window+1), and after
+            # (ASC, take window). Final order is id ASC.
+            before_rows = self._conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND id <= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, around_message_id, window + 1),
+            ).fetchall()
+            after_rows = self._conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, around_message_id, window),
+            ).fetchall()
+
+        # before_rows is DESC; reverse so it's ASC, then concatenate after_rows.
+        rows = list(reversed(before_rows)) + list(after_rows)
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_messages_around, falling back to []"
+                    )
+                    msg["tool_calls"] = []
+            result.append(msg)
+
+        # before_rows includes the anchor itself; subtract 1 for the count of
+        # messages strictly before the anchor in the returned slice.
+        messages_before = max(0, len(before_rows) - 1)
+        messages_after = len(after_rows)
+        return {
+            "window": result,
+            "messages_before": messages_before,
+            "messages_after": messages_after,
+        }
+
+    def get_anchored_view(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+        bookend: int = 3,
+        keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+    ) -> Dict[str, Any]:
+        """Return an anchored window plus session bookends.
+
+        Built on top of ``get_messages_around``. Three slices:
+
+          - ``window``: messages immediately surrounding the anchor. Filtered
+            to ``keep_roles`` (tool-response noise dropped by default), EXCEPT
+            the anchor itself is always preserved regardless of role.
+          - ``bookend_start``: first ``bookend`` user/assistant messages of the
+            session — but only those whose id is strictly before the window's
+            first message id. Empty when the window already overlaps the
+            session head. Empty-content messages (tool-call-only assistant
+            turns) are skipped so they don't crowd out actual prose openings.
+          - ``bookend_end``: last ``bookend`` user/assistant messages of the
+            session, same non-overlap rule at the tail.
+
+        Bookends let an FTS5 hit anywhere in a long session yield the goal
+        (opening) and the resolution (closing) on a single call — without
+        loading the whole transcript.
+
+        Returns ``{"window": [], "messages_before": 0, "messages_after": 0,
+        "bookend_start": [], "bookend_end": []}`` when the anchor isn't in
+        the session.
+
+        ``keep_roles=None`` disables role filtering (raw window + raw
+        bookends).
+        """
+        if bookend < 0:
+            bookend = 0
+
+        # Reuse the primitive — handles anchor-existence, content decoding,
+        # tool_calls deserialisation, and boundary counts.
+        primitive = self.get_messages_around(
+            session_id, around_message_id, window=window
+        )
+        window_rows = primitive["window"]
+        if not window_rows:
+            return {
+                "window": [],
+                "messages_before": 0,
+                "messages_after": 0,
+                "bookend_start": [],
+                "bookend_end": [],
+            }
+
+        # Apply role filter to the window, but never drop the anchor itself.
+        if keep_roles is not None:
+            keep_set = set(keep_roles)
+            filtered_window = [
+                m for m in window_rows
+                if m.get("id") == around_message_id or m.get("role") in keep_set
+            ]
+        else:
+            filtered_window = window_rows
+
+        window_min_id = window_rows[0]["id"]
+        window_max_id = window_rows[-1]["id"]
+
+        # Fetch bookends only when there's room outside the window. SQL filters
+        # by id range, role, and non-empty content — tool-call-only assistant
+        # turns (content='' with tool_calls populated) are excluded so they
+        # don't crowd out actual prose openings/closings.
+        bookend_start_rows: List[Any] = []
+        bookend_end_rows: List[Any] = []
+        if bookend > 0:
+            with self._lock:
+                role_clause = ""
+                role_params: list = []
+                if keep_roles is not None:
+                    role_placeholders = ",".join("?" for _ in keep_roles)
+                    role_clause = f" AND role IN ({role_placeholders})"
+                    role_params = list(keep_roles)
+
+                bookend_start_rows = self._conn.execute(
+                    f"SELECT * FROM messages "
+                    f"WHERE session_id = ? AND id < ?{role_clause} "
+                    f"AND length(content) > 0 "
+                    f"ORDER BY id ASC LIMIT ?",
+                    (session_id, window_min_id, *role_params, bookend),
+                ).fetchall()
+
+                bookend_end_rows = self._conn.execute(
+                    f"SELECT * FROM messages "
+                    f"WHERE session_id = ? AND id > ?{role_clause} "
+                    f"AND length(content) > 0 "
+                    f"ORDER BY id DESC LIMIT ?",
+                    (session_id, window_max_id, *role_params, bookend),
+                ).fetchall()
+                # End rows came back DESC for the LIMIT cap; flip to ASC.
+                bookend_end_rows = list(reversed(bookend_end_rows))
+
+        def _hydrate(row) -> Dict[str, Any]:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_anchored_view, falling back to []"
+                    )
+                    msg["tool_calls"] = []
+            return msg
+
+        return {
+            "window": filtered_window,
+            "messages_before": primitive["messages_before"],
+            "messages_after": primitive["messages_after"],
+            "bookend_start": [_hydrate(r) for r in bookend_start_rows],
+            "bookend_end": [_hydrate(r) for r in bookend_end_rows],
+        }
 
     def resolve_resume_session_id(self, session_id: str) -> str:
         """Redirect a resume target to the descendant session that holds the messages.
@@ -1686,8 +1925,8 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items "
-                f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp, id",
+                "codex_reasoning_items, codex_message_items, platform_message_id "
+                f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -1707,6 +1946,13 @@ class SessionDB:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
                     msg["tool_calls"] = []
+            # Surface the platform-side message id (e.g. yuanbao msg_id,
+            # telegram update_id) so platform-specific flows like recall
+            # can match by external identifier instead of having to fall
+            # back to content-match heuristics.  Exposed as ``message_id``
+            # for backward compatibility with the JSONL transcript shape.
+            if row["platform_message_id"]:
+                msg["message_id"] = row["platform_message_id"]
             # Restore reasoning fields on assistant messages so providers
             # that replay reasoning (OpenRouter, OpenAI, Nous) receive
             # coherent multi-turn reasoning context.
@@ -1872,20 +2118,54 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        sort: str = None,
     ) -> List[Dict[str, Any]]:
         """
-        Full-text search across session messages using FTS5（SQLite）或 LIKE（共享数据库）。
+        Full-text search across session messages using FTS5.
+
+        Supports FTS5 query syntax:
+          - Simple keywords: "docker deployment"
+          - Phrases: '"exact phrase"'
+          - Boolean: "docker OR kubernetes", "python NOT java"
+          - Prefix: "deploy*"
+
+        Returns matching messages with session metadata, content snippet,
+        and surrounding context (1 message before and after the match).
+
+        ``sort`` controls temporal ordering:
+          - ``None`` (default): FTS5 BM25 relevance only. Time-neutral.
+          - ``"newest"``: order by message timestamp DESC, then by rank.
+          - ``"oldest"``: order by message timestamp ASC, then by rank.
+
+        The short-CJK LIKE fallback already orders by timestamp DESC and
+        ignores ``sort``. The trigram CJK path honours ``sort`` like the main
+        FTS5 path.
         """
         if not query or not query.strip():
             return []
-        # 共享数据库不支持 FTS5，降级为 LIKE 搜索
-        if self._use_shared_db:
-            return self._search_messages_like(query, source_filter, exclude_sources,
-                                              role_filter, limit, offset)
 
         query = self._sanitize_fts5_query(query)
         if not query:
             return []
+
+        # Normalise sort. Anything not in the allowed set falls back to None
+        # (FTS5 rank-only) so callers can pass through user input without
+        # validation.
+        if isinstance(sort, str):
+            sort_norm = sort.strip().lower()
+            if sort_norm not in ("newest", "oldest"):
+                sort_norm = None
+        else:
+            sort_norm = None
+
+        # ORDER BY shared across the main FTS5 path and trigram CJK path.
+        # With sort set, timestamp is primary and rank is the tiebreaker.
+        if sort_norm == "newest":
+            order_by_sql = "ORDER BY m.timestamp DESC, rank"
+        elif sort_norm == "oldest":
+            order_by_sql = "ORDER BY m.timestamp ASC, rank"
+        else:
+            order_by_sql = "ORDER BY rank"
 
         # Build WHERE clauses dynamically
         where_clauses = ["messages_fts MATCH ?"]
@@ -1925,7 +2205,7 @@ class SessionDB:
             JOIN messages m ON m.id = messages_fts.rowid
             JOIN sessions s ON s.id = m.session_id
             WHERE {where_sql}
-            ORDER BY rank
+            {order_by_sql}
             LIMIT ? OFFSET ?
         """
 
@@ -1994,7 +2274,7 @@ class SessionDB:
                     JOIN messages m ON m.id = messages_fts_trigram.rowid
                     JOIN sessions s ON s.id = m.session_id
                     WHERE {' AND '.join(tri_where)}
-                    ORDER BY rank
+                    {order_by_sql}
                     LIMIT ? OFFSET ?
                 """
                 tri_params.extend([limit, offset])
@@ -2128,75 +2408,6 @@ class SessionDB:
         for match in matches:
             match.pop("content", None)
 
-        return matches
-
-    def _search_messages_like(
-        self,
-        query: str,
-        source_filter: List[str] = None,
-        exclude_sources: List[str] = None,
-        role_filter: List[str] = None,
-        limit: int = 20,
-        offset: int = 0,
-    ) -> List[Dict[str, Any]]:
-        """
-        共享数据库的 LIKE 搜索实现（替代 FTS5）。
-        """
-        raw_query = query.strip().strip('"').strip()
-        esc = raw_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-        where_parts = ["(m.content LIKE ? ESCAPE '\\\\' OR m.tool_name LIKE ? ESCAPE '\\\\')"]
-        params = [f"%{esc}%", f"%{esc}%"]
-
-        if source_filter is not None:
-            where_parts.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-            params.extend(source_filter)
-        if exclude_sources is not None:
-            where_parts.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
-            params.extend(exclude_sources)
-        if role_filter:
-            where_parts.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
-            params.extend(role_filter)
-
-        where_sql = " AND ".join(where_parts)
-        like_sql = f"""
-            SELECT m.id, m.session_id, m.role,
-                   SUBSTR(m.content, GREATEST(1, INSTR(m.content, ?) - 40), 120) AS snippet,
-                   m.content, m.timestamp, m.tool_name,
-                   s.source, s.model, s.started_at AS session_started
-            FROM messages m
-            JOIN sessions s ON s.id = m.session_id
-            WHERE {where_sql}
-            ORDER BY m.timestamp DESC
-            LIMIT ? OFFSET ?
-        """
-        like_params = [raw_query] + params + [limit, offset]
-
-        with self._lock:
-            cursor = self._conn.execute(like_sql, like_params)
-            matches = [dict(row) for row in cursor.fetchall()]
-
-        # 上下文
-        for match in matches:
-            try:
-                with self._lock:
-                    ctx_cursor = self._conn.execute(
-                        """SELECT role, content FROM (
-                            SELECT m.role, m.content, m.timestamp, m.id
-                            FROM messages m
-                            WHERE m.session_id = ? AND m.timestamp < ?
-                            ORDER BY m.timestamp DESC, m.id DESC LIMIT 1
-                        ) AS ctx""",
-                        (match["session_id"], match["timestamp"]),
-                    )
-                    ctx_msgs = [{"role": r["role"], "content": (r["content"] or "")[:200]}
-                                for r in ctx_cursor.fetchall()]
-                match["context"] = ctx_msgs
-            except Exception:
-                match["context"] = []
-
-        for match in matches:
-            match.pop("content", None)
         return matches
 
     def search_sessions(
@@ -2655,6 +2866,51 @@ class SessionDB:
                 return None
         return dict(row) if row else None
 
+    def list_telegram_topic_bindings_for_chat(
+        self,
+        *,
+        chat_id: str,
+    ) -> List[Dict[str, Any]]:
+        """All Telegram DM topic bindings for one chat, newest first.
+
+        Read-only; returns [] if the bindings table doesn't exist yet
+        (does not trigger the topic-mode migration).
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT * FROM telegram_dm_topic_bindings "
+                    "WHERE chat_id = ? ORDER BY updated_at DESC",
+                    (str(chat_id),),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
+
+    def get_telegram_topic_binding_by_session(
+        self,
+        *,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the Telegram DM topic binding for a given session_id, if present.
+
+        Uses the UNIQUE INDEX on telegram_dm_topic_bindings(session_id) for an
+        efficient reverse lookup. Returns None when the session has no binding or
+        the table does not exist yet.
+        """
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM telegram_dm_topic_bindings
+                    WHERE session_id = ?
+                    """,
+                    (str(session_id),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        return dict(row) if row else None
+
     def bind_telegram_topic(
         self,
         *,
@@ -2820,11 +3076,22 @@ class SessionDB:
     # ── Space reclamation ──
 
     def vacuum(self) -> None:
-        """Run VACUUM to reclaim disk space after large deletes（仅 SQLite 模式）。"""
-        if self._use_shared_db:
-            # PostgreSQL/MySQL 由自身管理磁盘空间，不需要手动 VACUUM
-            return
+        """Run VACUUM to reclaim disk space after large deletes.
+
+        SQLite does not shrink the database file when rows are deleted —
+        freed pages just get reused on the next insert. After a prune that
+        removed hundreds of sessions, the file stays bloated unless we
+        explicitly VACUUM.
+
+        VACUUM rewrites the entire DB, so it's expensive (seconds per
+        100MB) and cannot run inside a transaction. It also acquires an
+        exclusive lock, so callers must ensure no other writers are
+        active. Safe to call at startup before the gateway/CLI starts
+        serving traffic.
+        """
+        # VACUUM cannot be executed inside a transaction.
         with self._lock:
+            # Best-effort WAL checkpoint first, then VACUUM.
             try:
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception:
