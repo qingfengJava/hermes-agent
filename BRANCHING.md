@@ -56,15 +56,17 @@ git fetch upstream
 ```bash
 git checkout dev
 git pull origin dev
-git checkout -b feature/<简短描述>        # 例：feature/kanban-custom-columns
+git checkout -b feature/<英文业务名_YYYYMMDD>   # 例：feature/kanban_custom_columns_20260804
 
 # …开发、提交…
 # 提交信息遵循 Conventional Commits：feat/fix/docs/refactor/test/chore(可选 scope)
 
-git push -u origin feature/<描述>
-# 在 GitHub 开 PR：feature/<描述> → dev（默认分支已是 dev，不会开错目标）
+git push -u origin feature/<英文业务名_日期>
+# 在 GitHub 开 PR：feature/<英文业务名_日期> → dev（默认分支已是 dev，不会开错目标）
 # PR 合并后删除 feature 分支（本地 + 远程）
 ```
+
+**分支命名规范（强制）**：`feature/英文业务名_YYYYMMDD`——业务名用英文 snake_case，日期为切分支当天（8 位数字）。禁止中文、禁止无日期后缀。
 
 **开发前自检**：
 
